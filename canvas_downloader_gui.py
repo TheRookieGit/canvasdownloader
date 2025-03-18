@@ -68,6 +68,8 @@ class DownloadThread(QThread):
         super().__init__()
         self.config_file = config_file
         self.timeout = timeout
+        self.current_course = None
+        self.total_files_downloaded = 0
         
     def run(self):
         self.progress_signal.emit(f"开始下载: {os.path.basename(self.config_file)}")
@@ -92,6 +94,13 @@ class DownloadThread(QThread):
                     self.progress_signal.emit(f"错误: 配置缺少必要字段 '{field}'")
                     self.finished_signal.emit(False, f"配置缺少必要字段: {field}")
                     return
+            
+            # 检查是否有课程ID
+            if "courseIDs" in config and not config["courseIDs"]:
+                self.progress_signal.emit("错误: 没有指定任何课程ID")
+                self.finished_signal.emit(False, "没有指定任何课程ID")
+                return
+                
         except Exception as e:
             self.progress_signal.emit(f"错误: 无法解析配置文件: {e}")
             self.finished_signal.emit(False, f"无法解析配置文件: {e}")
@@ -102,115 +111,165 @@ class DownloadThread(QThread):
             # 查找canvassyncer可执行文件路径
             canvassyncer_path = find_canvassyncer_path()
             
-            # 构建命令
-            if canvassyncer_path == "python3 -m canvassyncer":
-                command = ["python3", "-m", "canvassyncer", "-p", self.config_file]
-            else:
-                command = [canvassyncer_path, "-p", self.config_file]
+            # 成功计数
+            successful_courses = 0
+            failed_courses = 0
+            
+            # 读取课程ID列表
+            course_ids = config.get("courseIDs", [])
+            total_courses = len(course_ids)
+            
+            self.progress_signal.emit(f"准备下载 {total_courses} 个课程的文件")
+            
+            for i, course_id in enumerate(course_ids):
+                self.current_course = course_id
+                self.progress_signal.emit(f"\n=== 课程 {i+1}/{total_courses}: ID {course_id} ===")
                 
-            self.progress_signal.emit(f"使用路径: {canvassyncer_path}")
-            self.progress_signal.emit(f"执行命令: {' '.join(command)}")
-            
-            # 创建进程
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                universal_newlines=True
-            )
-            
-            # 记录标准输出和错误
-            stdout_lines = []
-            stderr_lines = []
-            
-            # 读取输出
-            for line in process.stdout:
-                cleaned_line = line.strip()
-                stdout_lines.append(cleaned_line)
-                self.progress_signal.emit(cleaned_line)
-            
-            # 尝试读取错误输出
-            for line in process.stderr:
-                cleaned_line = line.strip()
-                stderr_lines.append(cleaned_line)
+                # 创建单课程的临时配置
+                import tempfile
+                fd, temp_course_config = tempfile.mkstemp(suffix='.json')
+                os.close(fd)
                 
-                # 检查是否为进度条或无害警告
-                if self.is_progress_bar(cleaned_line) or self.is_harmless_warning(cleaned_line):
-                    # 仍然显示输出，但不将其视为错误
-                    self.progress_signal.emit(f"信息: {cleaned_line}")
+                # 复制原始配置并更新单课程ID
+                single_course_config = config.copy()
+                single_course_config["courseIDs"] = [course_id]
+                
+                with open(temp_course_config, 'w', encoding='utf-8') as f:
+                    json.dump(single_course_config, f, indent=2, ensure_ascii=False)
+                
+                # 构建命令
+                if canvassyncer_path == "python3 -m canvassyncer":
+                    command = ["python3", "-m", "canvassyncer", "-p", temp_course_config]
                 else:
-                    self.progress_signal.emit(f"错误: {cleaned_line}")
-                
-            # 等待进程完成，最多等待timeout秒
-            try:
-                return_code = process.wait(timeout=self.timeout)
-                
-                # 检查是否有可能的错误
-                has_error = False
-                error_message = ""
-                
-                # 检查错误输出和常见错误信息
-                for line in stderr_lines:
-                    if line and not self.is_harmless_warning(line) and not self.is_progress_bar(line):
-                        has_error = True
-                        error_message = line
-                        break
-                        
-                # 检查标准输出中的错误信息
-                for line in stdout_lines:
-                    if "error:" in line.lower() or "exception:" in line.lower() or "traceback" in line.lower():
-                        has_error = True
-                        error_message = line
-                        break
-                
-                # 特别处理KeyError情况
-                if any("KeyError" in line for line in stdout_lines):
-                    self.progress_signal.emit("错误: 配置或网络问题")
-                    self.progress_signal.emit("请检查:")
-                    self.progress_signal.emit("1. Canvas API令牌是否有效")
-                    self.progress_signal.emit("2. Canvas网址是否正确")
-                    self.progress_signal.emit("3. 课程ID是否存在")
-                    self.progress_signal.emit("4. 网络连接是否正常")
-                    self.finished_signal.emit(False, "配置或网络问题导致下载失败")
-                    return
-                
-                # 检查下载完成的文件数量
-                files_found = 0
-                files_downloaded = 0
-                
-                for line in stdout_lines:
-                    if "Get " in line and " files!" in line:
-                        try:
-                            files_found = int(line.split("Get ")[1].split(" files")[0])
-                        except:
-                            pass
+                    command = [canvassyncer_path, "-p", temp_course_config]
                     
-                    if "Start to download " in line and " file(s)!" in line:
-                        try:
-                            files_downloaded = int(line.split("Start to download ")[1].split(" file(s)")[0])
-                        except:
-                            pass
+                self.progress_signal.emit(f"使用路径: {canvassyncer_path}")
+                self.progress_signal.emit(f"执行命令: {' '.join(command)}")
                 
-                # 如果找到文件并开始下载，且没有明确的错误，就认为是成功的
-                if files_found > 0 and files_downloaded > 0 and not has_error:
-                    self.progress_signal.emit(f"下载成功完成！共下载了 {files_downloaded} 个文件。")
-                    self.finished_signal.emit(True, f"下载成功完成，共 {files_downloaded} 个文件")
-                elif return_code == 0 and not has_error:
-                    self.progress_signal.emit("下载成功完成!")
-                    self.finished_signal.emit(True, "下载成功完成")
-                else:
-                    if has_error:
-                        self.progress_signal.emit(f"下载失败: {error_message}")
-                        self.finished_signal.emit(False, f"下载失败: {error_message}")
+                # 创建进程
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    universal_newlines=True
+                )
+                
+                # 记录标准输出和错误
+                stdout_lines = []
+                stderr_lines = []
+                
+                # 读取输出
+                for line in process.stdout:
+                    cleaned_line = line.strip()
+                    stdout_lines.append(cleaned_line)
+                    self.progress_signal.emit(cleaned_line)
+                
+                # 尝试读取错误输出
+                for line in process.stderr:
+                    cleaned_line = line.strip()
+                    stderr_lines.append(cleaned_line)
+                    
+                    # 检查是否为进度条或无害警告
+                    if self.is_progress_bar(cleaned_line) or self.is_harmless_warning(cleaned_line):
+                        # 仍然显示输出，但不将其视为错误
+                        self.progress_signal.emit(f"信息: {cleaned_line}")
                     else:
-                        self.progress_signal.emit(f"下载失败，返回代码: {return_code}")
-                        self.finished_signal.emit(False, f"下载失败，返回代码: {return_code}")
+                        self.progress_signal.emit(f"错误: {cleaned_line}")
                     
-            except subprocess.TimeoutExpired:
-                process.kill()
-                self.progress_signal.emit(f"下载超时 (>{self.timeout}秒)")
-                self.finished_signal.emit(False, f"下载超时 (>{self.timeout}秒)")
+                # 等待进程完成，最多等待timeout秒
+                try:
+                    return_code = process.wait(timeout=self.timeout)
+                    
+                    # 检查是否有可能的错误
+                    has_error = False
+                    error_message = ""
+                    
+                    # 检查错误输出和常见错误信息
+                    for line in stderr_lines:
+                        if line and not self.is_harmless_warning(line) and not self.is_progress_bar(line):
+                            has_error = True
+                            error_message = line
+                            break
+                            
+                    # 检查标准输出中的错误信息
+                    for line in stdout_lines:
+                        if "error:" in line.lower() or "exception:" in line.lower() or "traceback" in line.lower():
+                            has_error = True
+                            error_message = line
+                            break
+                    
+                    # 特别处理KeyError情况
+                    if any("KeyError" in line for line in stdout_lines):
+                        self.progress_signal.emit(f"错误: 课程 {course_id} 配置或网络问题")
+                        self.progress_signal.emit("请检查:")
+                        self.progress_signal.emit("1. Canvas API令牌是否有效")
+                        self.progress_signal.emit("2. Canvas网址是否正确")
+                        self.progress_signal.emit("3. 课程ID是否存在")
+                        self.progress_signal.emit("4. 网络连接是否正常")
+                        failed_courses += 1
+                        # 删除临时文件
+                        try:
+                            os.remove(temp_course_config)
+                        except:
+                            pass
+                        continue
+                    
+                    # 检查下载完成的文件数量
+                    files_found = 0
+                    files_downloaded = 0
+                    
+                    for line in stdout_lines:
+                        if "Get " in line and " files!" in line:
+                            try:
+                                files_found = int(line.split("Get ")[1].split(" files")[0])
+                            except:
+                                pass
+                        
+                        if "Start to download " in line and " file(s)!" in line:
+                            try:
+                                files_downloaded = int(line.split("Start to download ")[1].split(" file(s)")[0])
+                            except:
+                                pass
+                    
+                    # 如果找到文件并开始下载，且没有明确的错误，就认为是成功的
+                    if files_found > 0 and not has_error:
+                        self.progress_signal.emit(f"课程 {course_id} 下载成功！共下载了 {files_downloaded} 个文件。")
+                        successful_courses += 1
+                        self.total_files_downloaded += files_downloaded
+                    elif return_code == 0 and not has_error:
+                        self.progress_signal.emit(f"课程 {course_id} 下载成功!")
+                        successful_courses += 1
+                    else:
+                        if has_error:
+                            self.progress_signal.emit(f"课程 {course_id} 下载失败: {error_message}")
+                        else:
+                            self.progress_signal.emit(f"课程 {course_id} 下载失败，返回代码: {return_code}")
+                        failed_courses += 1
+                        
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    self.progress_signal.emit(f"课程 {course_id} 下载超时 (>{self.timeout}秒)")
+                    failed_courses += 1
+                
+                # 删除临时文件
+                try:
+                    os.remove(temp_course_config)
+                except:
+                    pass
+            
+            # 总结结果
+            self.progress_signal.emit("\n=== 下载完成 ===")
+            self.progress_signal.emit(f"总课程数: {total_courses}")
+            self.progress_signal.emit(f"成功下载: {successful_courses} 个课程")
+            if failed_courses > 0:
+                self.progress_signal.emit(f"下载失败: {failed_courses} 个课程")
+            self.progress_signal.emit(f"总共下载了 {self.total_files_downloaded} 个文件")
+            
+            if successful_courses == total_courses:
+                self.finished_signal.emit(True, f"所有 {total_courses} 个课程下载成功")
+            else:
+                self.finished_signal.emit(False, f"部分课程下载失败 ({failed_courses}/{total_courses})")
                 
         except FileNotFoundError:
             self.progress_signal.emit("错误: 找不到canvassyncer命令")
@@ -280,8 +339,15 @@ class ConfigEditorWidget(QWidget):
         self.base_url_input = QLineEdit()
         self.base_url_input.setPlaceholderText("例如: https://canvas.ucdavis.edu")
         
-        self.course_id_input = QLineEdit()
-        self.course_id_input.setPlaceholderText("课程ID (数字)")
+        # 多个课程ID输入框
+        self.course_id_inputs = []
+        course_id_layout = QVBoxLayout()
+        
+        for i in range(5):
+            course_input = QLineEdit()
+            course_input.setPlaceholderText(f"课程ID {i+1} (数字，可选)")
+            self.course_id_inputs.append(course_input)
+            course_id_layout.addWidget(course_input)
         
         # 下载路径选择
         path_layout = QHBoxLayout()
@@ -295,7 +361,7 @@ class ConfigEditorWidget(QWidget):
         # 添加表单字段
         form_layout.addRow("Canvas API令牌:", self.token_input)
         form_layout.addRow("Canvas网址:", self.base_url_input)
-        form_layout.addRow("课程ID:", self.course_id_input)
+        form_layout.addRow("课程ID列表:", course_id_layout)
         form_layout.addRow("下载目录:", path_layout)
         form_group.setLayout(form_layout)
         
@@ -378,11 +444,20 @@ class ConfigEditorWidget(QWidget):
         if not file_path.endswith('.json'):
             file_path += '.json'
             
+        # 收集所有有效的课程ID
+        course_ids = []
+        for course_input in self.course_id_inputs:
+            if course_input.text().strip():
+                try:
+                    course_ids.append(int(course_input.text()))
+                except ValueError:
+                    pass
+            
         # 构建配置 - 使用与原有脚本兼容的格式
         config = {
             "canvasURL": self.base_url_input.text(),
             "token": self.token_input.text(),
-            "courseIDs": [int(self.course_id_input.text())],
+            "courseIDs": course_ids,
             "downloadDir": self.download_path_input.text(),
             "filesizeThresh": 1000000000.0,  # 默认1GB文件大小限制
             "allowAudio": True,
@@ -440,10 +515,17 @@ class ConfigEditorWidget(QWidget):
             elif "base_url" in config:
                 self.base_url_input.setText(config["base_url"])
                 
+            # 清空所有课程输入框
+            for course_input in self.course_id_inputs:
+                course_input.clear()
+                
+            # 设置课程ID
             if "courseIDs" in config and len(config["courseIDs"]) > 0:
-                self.course_id_input.setText(str(config["courseIDs"][0]))
+                for i, course_id in enumerate(config["courseIDs"]):
+                    if i < len(self.course_id_inputs):
+                        self.course_id_inputs[i].setText(str(course_id))
             elif "course_id" in config:
-                self.course_id_input.setText(str(config["course_id"]))
+                self.course_id_inputs[0].setText(str(config["course_id"]))
                 
             if "downloadDir" in config:
                 self.download_path_input.setText(config["downloadDir"])
@@ -484,8 +566,15 @@ class ConfigEditorWidget(QWidget):
             QMessageBox.warning(self, "验证失败", "请输入Canvas网址")
             return False
             
-        if not self.course_id_input.text():
-            QMessageBox.warning(self, "验证失败", "请输入课程ID")
+        # 检查是否至少有一个课程ID
+        has_course_id = False
+        for course_input in self.course_id_inputs:
+            if course_input.text().strip():
+                has_course_id = True
+                break
+                
+        if not has_course_id:
+            QMessageBox.warning(self, "验证失败", "请至少输入一个课程ID")
             return False
             
         if not self.download_path_input.text():
@@ -496,10 +585,19 @@ class ConfigEditorWidget(QWidget):
         
     def get_config(self):
         """返回当前配置 - 使用与canvassyncer兼容的格式"""
+        # 收集所有有效的课程ID
+        course_ids = []
+        for course_input in self.course_id_inputs:
+            if course_input.text().strip():
+                try:
+                    course_ids.append(int(course_input.text()))
+                except ValueError:
+                    pass
+                    
         config = {
             "canvasURL": self.base_url_input.text(),
             "token": self.token_input.text(),
-            "courseIDs": [int(self.course_id_input.text())],
+            "courseIDs": course_ids,
             "downloadDir": self.download_path_input.text(),
             "filesizeThresh": 1000000000.0,
             "allowAudio": True,
@@ -672,7 +770,12 @@ class CanvasDownloaderGUI(QMainWindow):
             self.log_text.clear()
             self.log_text.append(f"使用配置文件: {self.temp_config_file}")
             self.log_text.append(f"Canvas网址: {config['canvasURL']}")
-            self.log_text.append(f"课程ID: {config['courseIDs'][0]}")
+            
+            # 显示所有课程ID
+            if 'courseIDs' in config and config['courseIDs']:
+                self.log_text.append(f"课程ID: {', '.join(map(str, config['courseIDs']))}")
+                self.log_text.append(f"待下载课程数量: {len(config['courseIDs'])}")
+            
             self.log_text.append(f"下载目录: {config['downloadDir']}")
             if 'includes' in config:
                 self.log_text.append(f"包含文件类型: {', '.join(config['includes'])}")
