@@ -1,0 +1,8 @@
+{
+  "token": "your_canvas_api_token_here",
+  "base_url": "https://canvas.instructure.com",
+  "course_id": "12345",
+  "download_path": "./course_files",
+  "includes": ["pdf", "docx", "pptx"],
+  "excludes": ["mp4"]
+} 
