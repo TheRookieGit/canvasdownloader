@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import json
+import logging
+import subprocess
+from pathlib import Path
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                            QLabel, QLineEdit, QPushButton, QFileDialog, QCheckBox, 
+                            QListWidget, QGroupBox, QFormLayout, QSpinBox, QMessageBox,
+                            QTabWidget, QTextEdit, QScrollArea, QFrame, QListWidgetItem)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings
+from PyQt5.QtGui import QIcon, QFont
+
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("canvas-downloader-gui")
+
+class DownloadThread(QThread):
+    """下载线程，防止UI卡顿"""
+    progress_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+    
+    def __init__(self, config_file, timeout):
+        super().__init__()
+        self.config_file = config_file
+        self.timeout = timeout
+        
+    def run(self):
+        self.progress_signal.emit(f"开始下载: {os.path.basename(self.config_file)}")
+        
+        # 验证配置文件
+        try:
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                
+            # 检查必要字段
+            required_fields = ['token', 'base_url', 'course_id']
+            for field in required_fields:
+                if field not in config:
+                    self.progress_signal.emit(f"错误: 配置缺少必要字段 '{field}'")
+                    self.finished_signal.emit(False, f"配置缺少必要字段: {field}")
+                    return
+        except Exception as e:
+            self.progress_signal.emit(f"错误: 无法解析配置文件: {e}")
+            self.finished_signal.emit(False, f"无法解析配置文件: {e}")
+            return
+        
+        # 执行下载
+        try:
+            command = ["canvassyncer", "-p", self.config_file]
+            self.progress_signal.emit(f"执行命令: {' '.join(command)}")
+            
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                universal_newlines=True
+            )
+            
+            # 读取输出
+            for line in process.stdout:
+                self.progress_signal.emit(line.strip())
+                
+            # 等待进程完成，最多等待timeout秒
+            try:
+                return_code = process.wait(timeout=self.timeout)
+                if return_code == 0:
+                    self.progress_signal.emit("下载成功完成!")
+                    self.finished_signal.emit(True, "下载成功完成")
+                else:
+                    self.progress_signal.emit(f"下载失败，返回代码: {return_code}")
+                    self.finished_signal.emit(False, f"下载失败，返回代码: {return_code}")
+            except subprocess.TimeoutExpired:
+                process.kill()
+                self.progress_signal.emit(f"下载超时 (>{self.timeout}秒)")
+                self.finished_signal.emit(False, f"下载超时 (>{self.timeout}秒)")
+                
+        except FileNotFoundError:
+            self.progress_signal.emit("错误: 找不到canvassyncer命令")
+            self.progress_signal.emit("请确保已安装canvassyncer，可以使用 'pip install canvassyncer' 安装")
+            self.finished_signal.emit(False, "找不到canvassyncer命令")
+        except Exception as e:
+            self.progress_signal.emit(f"错误: {str(e)}")
+            self.finished_signal.emit(False, str(e))
+
+
+class ConfigEditorWidget(QWidget):
+    """配置编辑器小部件"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.init_ui()
+        
+    def init_ui(self):
+        # 主布局
+        main_layout = QVBoxLayout()
+        
+        # 基本信息表单
+        form_group = QGroupBox("基本配置")
+        form_layout = QFormLayout()
+        
+        self.token_input = QLineEdit()
+        self.token_input.setEchoMode(QLineEdit.Password)  # 密码模式，不显示明文
+        self.token_input.setPlaceholderText("填写您的Canvas API令牌")
+        
+        self.base_url_input = QLineEdit()
+        self.base_url_input.setPlaceholderText("例如: https://canvas.instructure.com")
+        
+        self.course_id_input = QLineEdit()
+        self.course_id_input.setPlaceholderText("课程ID (数字)")
+        
+        # 下载路径选择
+        path_layout = QHBoxLayout()
+        self.download_path_input = QLineEdit()
+        self.download_path_input.setPlaceholderText("文件保存位置")
+        self.browse_btn = QPushButton("浏览...")
+        self.browse_btn.clicked.connect(self.browse_folder)
+        path_layout.addWidget(self.download_path_input)
+        path_layout.addWidget(self.browse_btn)
+        
+        # 添加表单字段
+        form_layout.addRow("Canvas API令牌:", self.token_input)
+        form_layout.addRow("Canvas网址:", self.base_url_input)
+        form_layout.addRow("课程ID:", self.course_id_input)
+        form_layout.addRow("下载路径:", path_layout)
+        form_group.setLayout(form_layout)
+        
+        # 文件类型过滤器
+        filter_group = QGroupBox("文件类型过滤")
+        filter_layout = QVBoxLayout()
+        
+        # 包含的文件类型
+        includes_layout = QVBoxLayout()
+        includes_label = QLabel("选择要下载的文件类型:")
+        self.includes_list = QListWidget()
+        self.includes_list.setSelectionMode(QListWidget.MultiSelection)
+        
+        # 常见文件类型
+        common_types = ["pdf", "docx", "pptx", "xlsx", "txt", "zip", "mp4", "mp3", "jpg", "png"]
+        for file_type in common_types:
+            item = QListWidgetItem(file_type)
+            self.includes_list.addItem(item)
+        
+        includes_layout.addWidget(includes_label)
+        includes_layout.addWidget(self.includes_list)
+        
+        # 排除的文件类型
+        excludes_layout = QVBoxLayout()
+        excludes_label = QLabel("选择要排除的文件类型:")
+        self.excludes_list = QListWidget()
+        self.excludes_list.setSelectionMode(QListWidget.MultiSelection)
+        
+        # 添加相同的常见文件类型供排除
+        for file_type in common_types:
+            item = QListWidgetItem(file_type)
+            self.excludes_list.addItem(item)
+            
+        excludes_layout.addWidget(excludes_label)
+        excludes_layout.addWidget(self.excludes_list)
+        
+        # 水平布局放置两个列表
+        types_layout = QHBoxLayout()
+        types_layout.addLayout(includes_layout)
+        types_layout.addLayout(excludes_layout)
+        
+        filter_layout.addLayout(types_layout)
+        filter_group.setLayout(filter_layout)
+        
+        # 按钮
+        buttons_layout = QHBoxLayout()
+        self.save_btn = QPushButton("保存配置")
+        self.save_btn.clicked.connect(self.save_config)
+        self.load_btn = QPushButton("加载配置")
+        self.load_btn.clicked.connect(self.load_config)
+        buttons_layout.addWidget(self.load_btn)
+        buttons_layout.addWidget(self.save_btn)
+        
+        # 添加所有组件到主布局
+        main_layout.addWidget(form_group)
+        main_layout.addWidget(filter_group)
+        main_layout.addLayout(buttons_layout)
+        
+        self.setLayout(main_layout)
+        
+    def browse_folder(self):
+        """选择下载文件夹"""
+        folder = QFileDialog.getExistingDirectory(self, "选择下载文件夹")
+        if folder:
+            self.download_path_input.setText(folder)
+            
+    def save_config(self):
+        """保存配置到文件"""
+        if not self.validate_inputs():
+            return
+            
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "保存配置文件", "", "JSON文件 (*.json)"
+        )
+        
+        if not file_path:
+            return
+            
+        # 如果没有.json后缀，添加它
+        if not file_path.endswith('.json'):
+            file_path += '.json'
+            
+        # 构建配置
+        config = {
+            "token": self.token_input.text(),
+            "base_url": self.base_url_input.text(),
+            "course_id": self.course_id_input.text(),
+            "download_path": self.download_path_input.text()
+        }
+        
+        # 添加包含的文件类型
+        includes = []
+        for i in range(self.includes_list.count()):
+            item = self.includes_list.item(i)
+            if item.isSelected():
+                includes.append(item.text())
+                
+        if includes:
+            config["includes"] = includes
+            
+        # 添加排除的文件类型
+        excludes = []
+        for i in range(self.excludes_list.count()):
+            item = self.excludes_list.item(i)
+            if item.isSelected():
+                excludes.append(item.text())
+                
+        if excludes:
+            config["excludes"] = excludes
+            
+        # 保存到文件
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            QMessageBox.information(self, "成功", f"配置已保存到: {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存配置时出错: {str(e)}")
+            
+    def load_config(self):
+        """从文件加载配置"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "打开配置文件", "", "JSON文件 (*.json)"
+        )
+        
+        if not file_path:
+            return
+            
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+                
+            # 设置基本字段
+            if "token" in config:
+                self.token_input.setText(config["token"])
+            if "base_url" in config:
+                self.base_url_input.setText(config["base_url"])
+            if "course_id" in config:
+                self.course_id_input.setText(config["course_id"])
+            if "download_path" in config:
+                self.download_path_input.setText(config["download_path"])
+                
+            # 清除所有选择
+            for i in range(self.includes_list.count()):
+                self.includes_list.item(i).setSelected(False)
+            for i in range(self.excludes_list.count()):
+                self.excludes_list.item(i).setSelected(False)
+                
+            # 设置包含的文件类型
+            if "includes" in config:
+                for i in range(self.includes_list.count()):
+                    item = self.includes_list.item(i)
+                    if item.text() in config["includes"]:
+                        item.setSelected(True)
+                        
+            # 设置排除的文件类型
+            if "excludes" in config:
+                for i in range(self.excludes_list.count()):
+                    item = self.excludes_list.item(i)
+                    if item.text() in config["excludes"]:
+                        item.setSelected(True)
+                        
+            QMessageBox.information(self, "成功", f"已加载配置: {file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"加载配置时出错: {str(e)}")
+            
+    def validate_inputs(self):
+        """验证输入字段"""
+        if not self.token_input.text():
+            QMessageBox.warning(self, "验证失败", "请输入Canvas API令牌")
+            return False
+            
+        if not self.base_url_input.text():
+            QMessageBox.warning(self, "验证失败", "请输入Canvas网址")
+            return False
+            
+        if not self.course_id_input.text():
+            QMessageBox.warning(self, "验证失败", "请输入课程ID")
+            return False
+            
+        if not self.download_path_input.text():
+            QMessageBox.warning(self, "验证失败", "请选择下载路径")
+            return False
+            
+        return True
+        
+    def get_config(self):
+        """返回当前配置"""
+        config = {
+            "token": self.token_input.text(),
+            "base_url": self.base_url_input.text(),
+            "course_id": self.course_id_input.text(),
+            "download_path": self.download_path_input.text()
+        }
+        
+        # 添加包含的文件类型
+        includes = []
+        for i in range(self.includes_list.count()):
+            item = self.includes_list.item(i)
+            if item.isSelected():
+                includes.append(item.text())
+                
+        if includes:
+            config["includes"] = includes
+            
+        # 添加排除的文件类型
+        excludes = []
+        for i in range(self.excludes_list.count()):
+            item = self.excludes_list.item(i)
+            if item.isSelected():
+                excludes.append(item.text())
+                
+        if excludes:
+            config["excludes"] = excludes
+            
+        return config
+
+
+class CanvasDownloaderGUI(QMainWindow):
+    """主窗口"""
+    
+    def __init__(self):
+        super().__init__()
+        self.temp_config_file = None
+        self.download_threads = []
+        self.init_ui()
+        
+    def init_ui(self):
+        """初始化UI"""
+        self.setWindowTitle("Canvas下载助手")
+        self.setMinimumSize(800, 600)
+        
+        # 中央小部件
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # 主布局
+        main_layout = QVBoxLayout(central_widget)
+        
+        # 创建标签页
+        tab_widget = QTabWidget()
+        
+        # 配置编辑器标签页
+        self.config_editor = ConfigEditorWidget()
+        tab_widget.addTab(self.config_editor, "配置课程")
+        
+        # 下载管理标签页
+        download_widget = QWidget()
+        download_layout = QVBoxLayout(download_widget)
+        
+        # 下载设置
+        settings_group = QGroupBox("下载设置")
+        settings_layout = QHBoxLayout()
+        
+        timeout_layout = QHBoxLayout()
+        timeout_label = QLabel("超时时间(秒):")
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(60, 3600)
+        self.timeout_spin.setValue(300)
+        self.timeout_spin.setSingleStep(60)
+        timeout_layout.addWidget(timeout_label)
+        timeout_layout.addWidget(self.timeout_spin)
+        
+        settings_layout.addLayout(timeout_layout)
+        settings_layout.addStretch()
+        settings_group.setLayout(settings_layout)
+        
+        # 控制按钮
+        controls_layout = QHBoxLayout()
+        self.download_btn = QPushButton("开始下载")
+        self.download_btn.clicked.connect(self.start_download)
+        self.download_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        controls_layout.addStretch()
+        controls_layout.addWidget(self.download_btn)
+        
+        # 日志输出
+        log_group = QGroupBox("下载日志")
+        log_layout = QVBoxLayout()
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        log_layout.addWidget(self.log_text)
+        log_group.setLayout(log_layout)
+        
+        # 将所有组件添加到下载页面
+        download_layout.addWidget(settings_group)
+        download_layout.addLayout(controls_layout)
+        download_layout.addWidget(log_group)
+        
+        tab_widget.addTab(download_widget, "下载管理")
+        
+        # 关于页面
+        about_widget = QWidget()
+        about_layout = QVBoxLayout(about_widget)
+        about_text = QTextEdit()
+        about_text.setReadOnly(True)
+        about_text.setHtml("""
+        <h2>Canvas下载助手</h2>
+        <p>版本: 0.1.0</p>
+        <p>一个简单的工具，用于批量同步和下载Canvas学习管理系统中的课程文件。</p>
+        
+        <h3>使用说明</h3>
+        <ol>
+            <li>在"配置课程"选项卡中填写Canvas API令牌和课程信息</li>
+            <li>选择要下载的文件类型和排除的文件类型</li>
+            <li>保存配置以便将来使用</li>
+            <li>切换到"下载管理"选项卡开始下载</li>
+        </ol>
+        
+        <h3>获取Canvas API令牌</h3>
+        <ol>
+            <li>登录您的Canvas账户</li>
+            <li>进入"账户" > "设置"</li>
+            <li>滚动到底部找到"批准的集成"部分</li>
+            <li>点击"新建访问令牌"</li>
+            <li>提供一个描述并生成令牌</li>
+        </ol>
+        
+        <h3>开源许可</h3>
+        <p>本软件采用MIT许可证</p>
+        <p>项目地址: <a href="https://github.com/yourusername/canvas-downloader">https://github.com/yourusername/canvas-downloader</a></p>
+        """)
+        about_layout.addWidget(about_text)
+        tab_widget.addTab(about_widget, "关于")
+        
+        main_layout.addWidget(tab_widget)
+        
+        # 设置主窗口
+        self.setLayout(main_layout)
+        
+    def start_download(self):
+        """开始下载过程"""
+        if not self.config_editor.validate_inputs():
+            return
+            
+        # 获取当前配置
+        config = self.config_editor.get_config()
+        
+        # 创建临时配置文件
+        try:
+            import tempfile
+            
+            # 如果已存在临时文件，删除它
+            if self.temp_config_file and os.path.exists(self.temp_config_file):
+                try:
+                    os.remove(self.temp_config_file)
+                except:
+                    pass
+                    
+            # 创建新的临时文件
+            fd, self.temp_config_file = tempfile.mkstemp(suffix='.json')
+            os.close(fd)
+            
+            with open(self.temp_config_file, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+                
+            # 清空日志
+            self.log_text.clear()
+            self.log_text.append(f"使用配置文件: {self.temp_config_file}")
+            self.log_text.append(f"课程ID: {config['course_id']}")
+            self.log_text.append(f"下载路径: {config['download_path']}")
+            if 'includes' in config:
+                self.log_text.append(f"包含文件类型: {', '.join(config['includes'])}")
+            if 'excludes' in config:
+                self.log_text.append(f"排除文件类型: {', '.join(config['excludes'])}")
+            self.log_text.append("正在准备下载...")
+            
+            # 创建并启动下载线程
+            thread = DownloadThread(self.temp_config_file, self.timeout_spin.value())
+            thread.progress_signal.connect(self.update_log)
+            thread.finished_signal.connect(self.download_finished)
+            
+            # 禁用下载按钮，避免重复点击
+            self.download_btn.setEnabled(False)
+            self.download_btn.setText("下载中...")
+            
+            # 保存并启动线程
+            self.download_threads.append(thread)
+            thread.start()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"启动下载失败: {str(e)}")
+            self.download_btn.setEnabled(True)
+            self.download_btn.setText("开始下载")
+            
+    def update_log(self, message):
+        """更新日志输出"""
+        self.log_text.append(message)
+        # 滚动到底部
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum()
+        )
+        
+    def download_finished(self, success, message):
+        """下载完成的处理"""
+        if success:
+            QMessageBox.information(self, "完成", "Canvas文件下载完成!")
+        else:
+            QMessageBox.warning(self, "警告", f"下载未完全成功: {message}")
+            
+        # 清理临时文件
+        if self.temp_config_file and os.path.exists(self.temp_config_file):
+            try:
+                os.remove(self.temp_config_file)
+                self.temp_config_file = None
+            except:
+                pass
+                
+        # 重新启用下载按钮
+        self.download_btn.setEnabled(True)
+        self.download_btn.setText("开始下载")
+        
+    def closeEvent(self, event):
+        """关闭时清理"""
+        # 停止所有线程
+        for thread in self.download_threads:
+            if thread.isRunning():
+                thread.terminate()
+                thread.wait()
+                
+        # 删除临时文件
+        if self.temp_config_file and os.path.exists(self.temp_config_file):
+            try:
+                os.remove(self.temp_config_file)
+            except:
+                pass
+                
+        event.accept()
+
+
+def main():
+    """主函数"""
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')  # 使用Fusion风格，外观更现代
+    
+    # 设置应用程序图标和名称
+    app.setApplicationName("Canvas下载助手")
+    
+    # 创建并显示主窗口
+    window = CanvasDownloaderGUI()
+    window.show()
+    
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main() 

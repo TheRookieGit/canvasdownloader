@@ -13,7 +13,7 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/yourusername/canvas-downloader",
     packages=find_packages(),
-    py_modules=["canvas_downloader"],
+    py_modules=["canvas_downloader", "canvas_downloader_gui"],
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
@@ -22,10 +22,14 @@ setup(
     python_requires=">=3.6",
     install_requires=[
         "canvassyncer>=0.1.0",
+        "PyQt5>=5.15.0",
     ],
     entry_points={
         "console_scripts": [
             "canvas-downloader=canvas_downloader:main",
+        ],
+        "gui_scripts": [
+            "canvas-downloader-gui=canvas_downloader_gui:main",
         ],
     },
 ) 

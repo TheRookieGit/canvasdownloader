@@ -1,0 +1,3 @@
+@echo off
+echo 正在启动Canvas下载助手...
+start canvas-downloader-gui 
